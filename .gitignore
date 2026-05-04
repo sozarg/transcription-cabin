@@ -1,0 +1,26 @@
+# Entorno virtual
+.venv/
+env/
+venv/
+
+# Cache de Modelos (PESADO - No subir)
+.cache/
+models/
+
+# Datos temporales y salidas
+downloads/
+transcripts/
+tmp/
+*.wav
+*.mp3
+*.m4a
+*.mp4
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# IDEs
+.vscode/
+.idea/
