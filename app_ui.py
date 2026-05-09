@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Iterable
+from urllib.parse import parse_qs, urlparse
 
 import gradio as gr
 
@@ -226,6 +227,7 @@ PHASE_LABELS = {
 }
 
 HISTORY_HEADERS = ["Inicio", "Fuente", "Estado", "Salida", "Duracion"]
+ALLOWED_EXTENSIONS = {".mp3", ".wav", ".m4a", ".mp4", ".mkv"}
 
 
 def _build_options(
@@ -318,6 +320,34 @@ def _refresh_ui(job_id: str | None) -> tuple:
     return _render_snapshot(JOB_MANAGER.get_snapshot(job_id or None))
 
 
+def _sanitize_file_paths(file_paths: list[str] | None) -> list[str]:
+    if not file_paths:
+        return []
+    return [path for path in file_paths if isinstance(path, str) and path.strip()]
+
+
+def _invalid_files(file_paths: list[str]) -> list[str]:
+    return [
+        path
+        for path in file_paths
+        if not any(path.lower().endswith(ext) for ext in ALLOWED_EXTENSIONS)
+    ]
+
+
+def _is_valid_youtube_url(url: str) -> bool:
+    parsed = urlparse(url.strip())
+    if parsed.scheme not in {"http", "https"}:
+        return False
+    host = parsed.netloc.lower()
+    if "youtube.com" in host:
+        if parsed.path == "/watch":
+            return bool(parse_qs(parsed.query).get("v", [""])[0].strip())
+        return parsed.path.startswith(("/shorts/", "/live/", "/embed/"))
+    if "youtu.be" in host:
+        return bool(parsed.path.strip("/"))
+    return False
+
+
 def _start_file_job(
     file_paths: list[str],
     model: str,
@@ -327,20 +357,34 @@ def _start_file_job(
     word_timestamps: bool,
     disable_vad: bool,
 ) -> tuple:
-    if not file_paths:
-        raise gr.Error("Upload at least one file before starting.")
-    
+    clean_paths = _sanitize_file_paths(file_paths)
+    if not clean_paths:
+        gr.Warning("Sube al menos un archivo antes de iniciar.")
+        return _refresh_ui(None)
+
+    invalid = _invalid_files(clean_paths)
+    if invalid:
+        invalid_list = "\n".join(f"- {path}" for path in invalid[:5])
+        gr.Warning(
+            "Hay archivos con formato no soportado. Usa mp3, wav, m4a, mp4 o mkv.\n"
+            f"{invalid_list}"
+        )
+        return _refresh_ui(None)
+
     last_job_id = None
-    for path in file_paths:
+    queued = 0
+    for path in clean_paths:
         try:
             last_job_id = JOB_MANAGER.start_file_job(
                 path,
                 _build_options(model, language, device, task, word_timestamps, disable_vad),
             )
+            queued += 1
         except RuntimeError as exc:
-            raise gr.Error(str(exc)) from exc
-    
-    # We return the status of the last queued job to update the UI
+            gr.Warning(str(exc))
+            return _refresh_ui(last_job_id)
+
+    gr.Info(f"Trabajo encolado: {queued} archivo(s).")
     return _refresh_ui(last_job_id)
 
 
@@ -353,15 +397,22 @@ def _start_youtube_job(
     word_timestamps: bool,
     disable_vad: bool,
 ) -> tuple:
-    if not url.strip():
-        raise gr.Error("Paste a YouTube URL before starting.")
+    clean_url = (url or "").strip()
+    if not clean_url:
+        gr.Warning("Pega una URL de YouTube antes de iniciar.")
+        return _refresh_ui(None)
+    if not _is_valid_youtube_url(clean_url):
+        gr.Warning("La URL no parece válida. Usa un enlace de youtube.com o youtu.be.")
+        return _refresh_ui(None)
     try:
         job_id = JOB_MANAGER.start_youtube_job(
-            url.strip(),
+            clean_url,
             _build_options(model, language, device, task, word_timestamps, disable_vad),
         )
     except RuntimeError as exc:
-        raise gr.Error(str(exc)) from exc
+        gr.Warning(str(exc))
+        return _refresh_ui(None)
+    gr.Info("Descarga y transcripción iniciadas.")
     return _refresh_ui(job_id)
 
 

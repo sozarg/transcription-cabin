@@ -2,6 +2,23 @@
 
 This project is designed to transcribe local files and YouTube URLs using `faster-whisper`.
 
+## Hugging Face Token (Recommended)
+
+To avoid unauthenticated download warnings and improve model download limits/speed:
+
+```powershell
+.\set-hf-token.ps1
+```
+
+Or create a local `.env` file (see `.env.example`) with:
+
+```text
+HF_TOKEN=hf_...
+HUGGINGFACE_HUB_TOKEN=hf_...
+```
+
+`launch-ui.ps1`, `transcribe.ps1`, and `download-audio.ps1` now load `.env` automatically.
+
 ## Local Interface
 
 Start the app:
@@ -87,3 +104,9 @@ Let it detect the language automatically:
 - `turbo` is significantly faster.
 - The first time a new model is used, it will take longer as it downloads the weights.
 - The pipeline uses GPU automatically if available.
+
+## Privacy and Public Sharing
+
+- Keep tokens only in local `.env` files.
+- Never commit `.env` or private transcription outputs.
+- Use `.env.example` only as a template with placeholder values.
