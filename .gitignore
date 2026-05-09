@@ -15,6 +15,7 @@ tmp/
 *.mp3
 *.m4a
 *.mp4
+*.mkv
 
 # Python
 __pycache__/
