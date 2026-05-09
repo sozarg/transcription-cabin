@@ -14,6 +14,35 @@ param(
 $scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $python = Join-Path $scriptRoot ".venv\Scripts\python.exe"
 $script = Join-Path $scriptRoot "scripts\transcribe.py"
+if (-not (Test-Path $python)) {
+    $python = "python"
+}
+
+function Import-DotEnvFile {
+    param([string]$Path)
+    if (-not (Test-Path $Path)) {
+        return
+    }
+
+    foreach ($line in Get-Content $Path) {
+        $trimmed = $line.Trim()
+        if (-not $trimmed -or $trimmed.StartsWith("#")) {
+            continue
+        }
+        $parts = $trimmed -split "=", 2
+        if ($parts.Count -ne 2) {
+            continue
+        }
+        $key = $parts[0].Trim()
+        $value = $parts[1].Trim().Trim("'").Trim('"')
+        if ($key) {
+            [Environment]::SetEnvironmentVariable($key, $value, "Process")
+        }
+    }
+}
+
+Import-DotEnvFile -Path (Join-Path $scriptRoot ".env")
+
 $device = if ($Cpu) { "cpu" } else { "auto" }
 $nvidiaBins = @(
     (Join-Path $scriptRoot ".venv\Lib\site-packages\nvidia\cublas\bin"),
