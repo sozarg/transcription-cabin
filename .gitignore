@@ -24,3 +24,8 @@ __pycache__/
 # IDEs
 .vscode/
 .idea/
+
+# Secrets
+.env
+.env.*
+!.env.example
