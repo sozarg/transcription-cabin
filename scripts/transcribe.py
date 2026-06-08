@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import queue
 import re
+import sys
 import threading
 import traceback
 from dataclasses import dataclass, field
@@ -22,6 +24,7 @@ BASE_DIR = Path(__file__).resolve().parents[1]
 DEFAULT_OUTPUT_DIR = BASE_DIR / "transcripts"
 DEFAULT_DOWNLOAD_DIR = BASE_DIR / "downloads"
 DEFAULT_MODEL_CACHE = BASE_DIR / ".cache" / "models"
+DEFAULT_LOCK_PATH = BASE_DIR / ".cache" / "transcription.lock"
 
 MODEL_CHOICES = ("large-v3", "turbo", "medium", "small", "base", "tiny")
 LANGUAGE_CHOICES = ("auto", "es", "en", "pt", "fr", "de", "it")
@@ -172,6 +175,7 @@ class JobRecord:
     result: TranscriptionResult | None = None
     error_message: str | None = None
     thread: threading.Thread | None = None
+    log_path: Path | None = None
     _run_fn: Callable[[], None] | None = None
 
     def emit(
@@ -209,7 +213,10 @@ class JobRecord:
             self.events.append(event)
             if len(self.events) > 400:
                 self.events = self.events[-400:]
+            log_path = self.log_path
         _print_event(event)
+        if log_path:
+            _append_log_event(log_path, event)
 
     @property
     def is_active(self) -> bool:
@@ -395,6 +402,7 @@ class JobManager:
     ) -> JobRecord:
         with self._lock:
             started_at = datetime.now()
+            output_dir.mkdir(parents=True, exist_ok=True)
             record = JobRecord(
                 job_id=uuid4().hex[:8],
                 source_label=source_label,
@@ -402,6 +410,7 @@ class JobManager:
                 progress_profile=progress_profile,
                 started_at_dt=started_at,
                 started_at_text=started_at.strftime("%Y-%m-%d %H:%M:%S"),
+                log_path=output_dir / "run.log",
             )
             self._records[record.job_id] = record
             self._last_job_id = record.job_id
@@ -430,7 +439,9 @@ class JobManager:
             download = _download_audio_with_reporter(record, url, download_dir)
             record.source_label = f"{download.title} ({download.downloaded_path.name})"
             output_dir = build_session_dir(DEFAULT_OUTPUT_DIR, download.title)
+            output_dir.mkdir(parents=True, exist_ok=True)
             record.output_dir = output_dir
+            record.log_path = output_dir / "run.log"
             return _transcribe_pipeline(record, download.downloaded_path, output_dir, options)
 
         self._run_pipeline(record, pipeline)
@@ -513,6 +524,7 @@ def download_audio(
         progress_profile=YOUTUBE_PHASE_RANGES,
         started_at_dt=now,
         started_at_text=now.strftime("%Y-%m-%d %H:%M:%S"),
+        log_path=output_dir / "run.log",
     )
     return _download_audio_with_reporter(record, url, output_dir, status_callback=status_callback)
 
@@ -533,9 +545,11 @@ def transcribe_file(
         progress_profile=LOCAL_PHASE_RANGES,
         started_at_dt=now,
         started_at_text=now.strftime("%Y-%m-%d %H:%M:%S"),
+        log_path=resolved_output / "run.log",
     )
     result = _transcribe_pipeline(record, Path(input_path), resolved_output, options, status_callback=status_callback)
     result.job_status = "done"
+    record.emit("done", "done", "Job finished. Results ready.", 1.0)
     result.events = list(record.events)
     return result
 
@@ -625,6 +639,51 @@ def _transcribe_pipeline(
     options: TranscriptionOptions,
     status_callback: StatusCallback | None = None,
 ) -> TranscriptionResult:
+    with _exclusive_transcription_slot(record):
+        return _transcribe_pipeline_unlocked(record, input_path, output_dir, options, status_callback)
+
+
+@contextlib.contextmanager
+def _exclusive_transcription_slot(record: JobRecord):
+    DEFAULT_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    record.emit("queued", "queued", "Esperando turno exclusivo de transcripcion.")
+    lock_file = DEFAULT_LOCK_PATH.open("a+b")
+    try:
+        lock_file.seek(0, os.SEEK_END)
+        if lock_file.tell() == 0:
+            lock_file.write(b"0")
+            lock_file.flush()
+        if os.name == "nt":
+            import msvcrt
+
+            lock_file.seek(0)
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+            try:
+                record.emit("queued", "queued", "Turno adquirido. Iniciando trabajo.")
+                yield
+            finally:
+                lock_file.seek(0)
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                record.emit("queued", "queued", "Turno adquirido. Iniciando trabajo.")
+                yield
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    finally:
+        lock_file.close()
+
+
+def _transcribe_pipeline_unlocked(
+    record: JobRecord,
+    input_path: Path,
+    output_dir: Path,
+    options: TranscriptionOptions,
+    status_callback: StatusCallback | None = None,
+) -> TranscriptionResult:
     started = datetime.now()
     input_path = _resolve_path(input_path)
     output_dir = _resolve_path(output_dir)
@@ -688,19 +747,22 @@ def _transcribe_pipeline(
             status_callback(message)
 
     _raise_if_cancelled(record)
-    record.emit("writing_outputs", "writing_outputs", "Escribiendo TXT, SRT, VTT y JSON.", 0.0)
+    record.emit("writing_outputs", "writing_outputs", "Escribiendo TXT, SRT, VTT, JSON y resumen.", 0.0)
     if status_callback:
         status_callback("Escribiendo archivos de salida")
+    transcript_text = "\n".join(segment.text.strip() for segment in segments if segment.text.strip())
     output_files = _write_outputs(
         output_dir,
         input_path.stem,
         segments,
+        transcript_text,
         detected_language,
         language_probability,
         options,
         total_duration,
     )
-    transcript_text = "\n".join(segment.text.strip() for segment in segments if segment.text.strip())
+    if record.log_path:
+        output_files["log"] = record.log_path
     elapsed = (datetime.now() - started).total_seconds()
 
     return TranscriptionResult(
@@ -765,6 +827,7 @@ def _write_outputs(
     output_dir: Path,
     stem: str,
     segments: list[object],
+    transcript_text: str,
     detected_language: str | None,
     language_probability: float | None,
     options: TranscriptionOptions,
@@ -774,10 +837,11 @@ def _write_outputs(
     srt_path = output_dir / f"{stem}.srt"
     vtt_path = output_dir / f"{stem}.vtt"
     json_path = output_dir / f"{stem}.json"
+    summary_path = output_dir / f"{stem}-summary.md"
 
-    txt_path.write_text(_to_txt(segments), encoding="utf-8")
-    srt_path.write_text(_to_srt(segments), encoding="utf-8")
-    vtt_path.write_text(_to_vtt(segments), encoding="utf-8")
+    txt_path.write_text(_to_txt(segments), encoding="utf-8-sig")
+    srt_path.write_text(_to_srt(segments), encoding="utf-8-sig")
+    vtt_path.write_text(_to_vtt(segments), encoding="utf-8-sig")
     json_path.write_text(
         json.dumps(
             {
@@ -793,7 +857,11 @@ def _write_outputs(
         ),
         encoding="utf-8",
     )
-    return {"txt": txt_path, "srt": srt_path, "vtt": vtt_path, "json": json_path}
+    summary_path.write_text(
+        _to_summary_markdown(stem, transcript_text, segments, detected_language, options, total_duration),
+        encoding="utf-8-sig",
+    )
+    return {"txt": txt_path, "srt": srt_path, "vtt": vtt_path, "json": json_path, "summary": summary_path}
 
 
 def _to_txt(segments: list[object]) -> str:
@@ -826,6 +894,172 @@ def _to_vtt(segments: list[object]) -> str:
             ]
         )
     return "\n".join(lines).strip() + "\n"
+
+
+def _to_summary_markdown(
+    stem: str,
+    transcript_text: str,
+    segments: list[object],
+    detected_language: str | None,
+    options: TranscriptionOptions,
+    total_duration: float | None,
+) -> str:
+    clean_text = _collapse_spaces(transcript_text)
+    key_points = _extract_key_points(clean_text)
+    technical_terms = _extract_technical_terms(clean_text)
+    timeline = _extract_timeline(segments)
+    duration = _format_duration(total_duration) if total_duration else "desconocida"
+
+    lines = [
+        f"# Resumen - {stem}",
+        "",
+        "## Metadata",
+        f"- Modelo: `{options.model}`",
+        f"- Tarea: `{options.task}`",
+        f"- Idioma pedido: `{options.language}`",
+        f"- Idioma detectado: `{detected_language or 'desconocido'}`",
+        f"- Duracion: `{duration}`",
+        f"- Segmentos: `{len(segments)}`",
+        "",
+        "## Resumen Corto",
+        _build_short_summary(clean_text),
+        "",
+        "## Puntos Principales",
+    ]
+    lines.extend(f"- {item}" for item in key_points)
+    lines.extend(["", "## Linea De Tiempo"])
+    lines.extend(f"- {item}" for item in timeline)
+    lines.extend(["", "## Terminos Detectados"])
+    if technical_terms:
+        lines.extend(f"- `{term}`" for term in technical_terms)
+    else:
+        lines.append("- No se detectaron terminos tecnicos frecuentes.")
+    lines.extend(
+        [
+            "",
+            "## Nota",
+            "Este resumen es extractivo y automatico. Para entrega formal conviene revisar nombres propios, fechas y terminos tecnicos.",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _build_short_summary(text: str) -> str:
+    sentences = _split_sentences(text)
+    if not sentences:
+        return "No se detecto texto suficiente para resumir."
+    selected = sentences[:2]
+    if len(sentences) > 6:
+        selected.append(sentences[len(sentences) // 2])
+    if len(sentences) > 3:
+        selected.append(sentences[-1])
+    return " ".join(_dedupe_preserve_order(selected)[:4])
+
+
+def _extract_key_points(text: str) -> list[str]:
+    sentences = _split_sentences(text)
+    if not sentences:
+        return ["No se detecto texto suficiente."]
+
+    keywords = (
+        "vamos a",
+        "tienen que",
+        "hay que",
+        "recuerden",
+        "importante",
+        "entrega",
+        "sprint",
+        "login",
+        "registro",
+        "jwt",
+        "mongo",
+        "mongoose",
+        "vercel",
+        "angular",
+        "nestjs",
+        "base de datos",
+    )
+    ranked: list[tuple[int, int, str]] = []
+    for index, sentence in enumerate(sentences):
+        lower = sentence.lower()
+        score = sum(2 for keyword in keywords if keyword in lower)
+        score += min(len(sentence) // 80, 3)
+        if score > 0:
+            ranked.append((score, -index, sentence))
+    ranked.sort(reverse=True)
+    selected = [sentence for _, _, sentence in ranked[:8]] or sentences[:6]
+    return _dedupe_preserve_order(selected)[:8]
+
+
+def _extract_timeline(segments: list[object]) -> list[str]:
+    if not segments:
+        return ["No hay segmentos para armar linea de tiempo."]
+    desired = 8
+    if len(segments) <= desired:
+        selected = segments
+    else:
+        step = max(len(segments) // desired, 1)
+        selected = [segments[index] for index in range(0, len(segments), step)][:desired]
+    items = []
+    for segment in selected:
+        text = _collapse_spaces(getattr(segment, "text", "").strip())
+        if text:
+            items.append(f"`{_format_vtt_timestamp(float(getattr(segment, 'start', 0.0)))}` {text[:180]}")
+    return items or ["No hay texto suficiente para armar linea de tiempo."]
+
+
+def _extract_technical_terms(text: str) -> list[str]:
+    known = [
+        "Angular",
+        "API",
+        "Atlas",
+        "DTO",
+        "GitHub",
+        "JSON",
+        "JWT",
+        "MongoDB",
+        "Mongoose",
+        "NestJS",
+        "Vercel",
+    ]
+    lower = text.lower()
+    found = [term for term in known if term.lower() in lower]
+    return sorted(set(found), key=str.lower)
+
+
+def _split_sentences(text: str) -> list[str]:
+    clean = _collapse_spaces(text)
+    if not clean:
+        return []
+    sentences = re.split(r"(?<=[.!?])\s+", clean)
+    if len(sentences) < 3:
+        sentences = re.split(r"\s{2,}|\n+", text)
+    return [sentence.strip() for sentence in sentences if len(sentence.strip()) >= 20]
+
+
+def _dedupe_preserve_order(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for item in items:
+        normalized = item.lower()
+        if normalized not in seen:
+            seen.add(normalized)
+            result.append(item)
+    return result
+
+
+def _collapse_spaces(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _format_duration(seconds: float | None) -> str:
+    if seconds is None:
+        return "desconocida"
+    total = int(round(max(seconds, 0.0)))
+    hours, rem = divmod(total, 3600)
+    minutes, sec = divmod(rem, 60)
+    return f"{hours:02d}:{minutes:02d}:{sec:02d}"
 
 
 def _segment_to_dict(segment: object) -> dict[str, object]:
@@ -892,6 +1126,7 @@ def _build_summary(
         f"Inicio: `{record.started_at_text}`",
         f"Duracion corrida: `{record.elapsed_seconds():.1f}s`",
         f"Salida: `{record.output_dir}`",
+        f"Log: `{record.log_path or '-'}`",
     ]
     if result:
         lines.extend(
@@ -916,6 +1151,17 @@ def _print_event(event: JobEvent) -> None:
         f"[{event.timestamp}] {event.phase} [{event.progress:5.1f}%] {event.message}{suffix}",
         flush=True,
     )
+
+
+def _append_log_event(log_path: Path, event: JobEvent) -> None:
+    suffix = f" | {event.detail}" if event.detail else ""
+    line = f"[{event.timestamp}] {event.phase} [{event.progress:5.1f}%] {event.message}{suffix}\n"
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a", encoding="utf-8-sig") as log_file:
+            log_file.write(line)
+    except OSError:
+        print(f"No se pudo escribir el log: {log_path}", file=sys.stderr, flush=True)
 
 
 def _now_text() -> str:
