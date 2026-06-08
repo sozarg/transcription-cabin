@@ -56,7 +56,11 @@ From the interface, you can:
 - Upload `mp3`, `wav`, `m4a`, `mp4`, `mkv` files.
 - Paste a YouTube URL.
 - Choose the model, language, and computing device.
-- Download results in `txt`, `srt`, `vtt`, and `json` formats.
+- Download results in `txt`, `srt`, `vtt`, `json`, `summary.md`, and `run.log` formats.
+
+The app processes one transcription at a time. Extra jobs are queued automatically so a `large-v3`
+run does not compete with another transcription for GPU/CPU memory. Terminal runs use the same
+local lock, so launching two scripts at once will make the second one wait for its turn.
 
 ## Terminal Usage
 
@@ -104,6 +108,8 @@ Let it detect the language automatically:
 - `turbo` is significantly faster.
 - The first time a new model is used, it will take longer as it downloads the weights.
 - The pipeline uses GPU automatically if available.
+- Text subtitle outputs are written with UTF-8 BOM for better compatibility with Windows tools.
+- Each output folder includes `run.log` with live progress events and `summary.md` with an automatic extractive summary.
 
 ## Privacy and Public Sharing
 
