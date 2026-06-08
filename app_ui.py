@@ -443,7 +443,7 @@ def build_demo() -> gr.Blocks:
               <h1>Upload audio, monitor the process, and download the results.</h1>
               <p>
                 The app runs on your machine, handles one active job at a time, writes live logs,
-                and saves <strong>TXT, SRT, VTT, and JSON</strong> to <code>{DEFAULT_OUTPUT_DIR}</code>.
+                and saves <strong>TXT, SRT, VTT, JSON, logs, and summaries</strong> to <code>{DEFAULT_OUTPUT_DIR}</code>.
                 Temporary YouTube downloads are stored in <code>{DEFAULT_DOWNLOAD_DIR}</code>.
               </p>
             </section>
