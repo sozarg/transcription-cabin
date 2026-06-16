@@ -8,6 +8,7 @@ import queue
 import re
 import sys
 import threading
+import time
 import traceback
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -19,6 +20,11 @@ import av
 import ctranslate2
 import yt_dlp
 from faster_whisper import WhisperModel
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 DEFAULT_OUTPUT_DIR = BASE_DIR / "transcripts"
@@ -74,6 +80,10 @@ NVIDIA_BIN_PATHS = (
 
 _MODEL_CACHE: dict[tuple[str, str], WhisperModel] = {}
 _MODEL_LOCK = threading.Lock()
+_EVENT_PRINT_LAST_AT: dict[str, float] = {}
+_CLI_STATUS_LAST_AT: dict[str, float] = {}
+_SEGMENT_PRINT_INTERVAL_SECONDS = 10.0
+_QUEUE_PRINT_INTERVAL_SECONDS = 30.0
 
 
 class JobCancelledError(RuntimeError):
@@ -224,6 +234,9 @@ class JobRecord:
 
     def elapsed_seconds(self) -> float:
         return max((datetime.now() - self.started_at_dt).total_seconds(), 0.0)
+
+    def wait_for_cancel(self, timeout_seconds: float) -> bool:
+        return self.cancel_event.wait(timeout_seconds)
 
 
 class JobManager:
@@ -657,7 +670,20 @@ def _exclusive_transcription_slot(record: JobRecord):
             import msvcrt
 
             lock_file.seek(0)
-            msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+            while True:
+                try:
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError as exc:
+                    winerror = getattr(exc, "winerror", None)
+                    errno_code = getattr(exc, "errno", None)
+                    lock_is_busy = winerror in {33, 36} or errno_code in {13, 33, 36}
+                    if not lock_is_busy:
+                        raise
+                    if record.cancel_event.is_set():
+                        raise JobCancelledError() from exc
+                    record.emit("queued", "queued", "Sigue en cola. Esperando liberacion del lock.")
+                    record.wait_for_cancel(1.0)
             try:
                 record.emit("queued", "queued", "Turno adquirido. Iniciando trabajo.")
                 yield
@@ -1146,11 +1172,31 @@ def _build_summary(
 
 
 def _print_event(event: JobEvent) -> None:
+    if not _should_print_event(event):
+        return
     suffix = f" | {event.detail}" if event.detail else ""
-    print(
-        f"[{event.timestamp}] {event.phase} [{event.progress:5.1f}%] {event.message}{suffix}",
-        flush=True,
-    )
+    text = f"[{event.timestamp}] {event.phase} [{event.progress:5.1f}%] {event.message}{suffix}"
+    try:
+        print(text, flush=True)
+    except UnicodeEncodeError:
+        print(text.encode("utf-8", errors="replace").decode("utf-8"), flush=True)
+
+
+def _should_print_event(event: JobEvent) -> bool:
+    now = time.monotonic()
+    if event.phase == "transcribing" and event.message.startswith("Segmento "):
+        last_at = _EVENT_PRINT_LAST_AT.get("transcribing_segments", 0.0)
+        if now - last_at < _SEGMENT_PRINT_INTERVAL_SECONDS:
+            return False
+        _EVENT_PRINT_LAST_AT["transcribing_segments"] = now
+        return True
+    if event.phase == "queued" and event.message.startswith("Sigue en cola"):
+        last_at = _EVENT_PRINT_LAST_AT.get("queued_wait", 0.0)
+        if now - last_at < _QUEUE_PRINT_INTERVAL_SECONDS:
+            return False
+        _EVENT_PRINT_LAST_AT["queued_wait"] = now
+        return True
+    return True
 
 
 def _append_log_event(log_path: Path, event: JobEvent) -> None:
@@ -1169,6 +1215,12 @@ def _now_text() -> str:
 
 
 def _cli_status(message: str) -> None:
+    if message.startswith("Segmento "):
+        now = time.monotonic()
+        last_at = _CLI_STATUS_LAST_AT.get("segments", 0.0)
+        if now - last_at < _SEGMENT_PRINT_INTERVAL_SECONDS:
+            return
+        _CLI_STATUS_LAST_AT["segments"] = now
     print(f"[{_now_text()}] {message}", flush=True)
 
 
