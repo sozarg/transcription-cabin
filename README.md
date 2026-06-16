@@ -70,6 +70,15 @@ Transcribe a local file:
 .\transcribe.ps1 -FilePath "C:\path\to\audio.mp3"
 ```
 
+Queue a local file in the background:
+
+```powershell
+.\queue-transcription.ps1 -FilePath "C:\path\to\audio.mp3"
+```
+
+Queued terminal jobs share the same local lock as the UI. Each background job writes
+launcher logs under `logs\queued-*`; transcription outputs still go to `transcripts`.
+
 Download only the audio from YouTube:
 
 ```powershell
