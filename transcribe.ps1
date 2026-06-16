@@ -43,6 +43,9 @@ function Import-DotEnvFile {
 
 Import-DotEnvFile -Path (Join-Path $scriptRoot ".env")
 
+$env:PYTHONIOENCODING = "utf-8"
+$env:PYTHONUTF8 = "1"
+
 $device = if ($Cpu) { "cpu" } else { "auto" }
 $nvidiaBins = @(
     (Join-Path $scriptRoot ".venv\Lib\site-packages\nvidia\cublas\bin"),
