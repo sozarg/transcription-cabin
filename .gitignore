@@ -10,6 +10,7 @@ models/
 # Datos temporales y salidas
 downloads/
 transcripts/
+logs/
 tmp/
 *.wav
 *.mp3
